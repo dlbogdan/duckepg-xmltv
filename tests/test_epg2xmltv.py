@@ -55,6 +55,13 @@ class Tests(unittest.TestCase):
             self.assertFalse(healthy)
             self.assertFalse(details["guide_exists"])
 
+    def test_collection_frequency_reuses_persisted_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = app.Config(data_dir=Path(directory), seed_frequency=111)
+            db = app.connect(cfg)
+            app.remember_collection_frequency(db, 706000000)
+            self.assertEqual(706000000, app.collection_frequency(cfg, db))
+
 
 if __name__ == "__main__":
     unittest.main()

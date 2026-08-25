@@ -1,8 +1,9 @@
 # Lightweight HDHomeRun DVB-C EIT to XMLTV
 
 This replaces TVHeadend only for guide collection. Plex remains connected
-directly to the HDHomeRun. The collector uses no more than one free tuner,
-visits multiplexes sequentially, persists the last good guide, and serves it at
+directly to the HDHomeRun. Initial discovery learns and persists the cable
+topology. Routine updates use no more than one free tuner and capture only the
+known guide-bearing mux, persist the last good guide, and serve it at
 `http://PORTAINER-IP:8080/guide.xml` without authentication. Restrict port 8080
 to the trusted LAN in the host firewall.
 
@@ -34,7 +35,10 @@ dedicated EPG channel.
 3. Keep `TUNER_IP=10.9.2.132`, `TZ=Europe/Bucharest`, and
    `EPG_SCHEDULE=03:00`. The schedule is local wall-clock time.
 4. The first start captures the known seed, learns the mux/service map from NIT
-   and SDT, stores it in SQLite, and publishes the initial guide.
+   and SDT, stores it in SQLite, and publishes the initial guide. Subsequent
+   scheduled updates do not rediscover or traverse the mux list: they capture
+   network-wide EIT from the persisted 706 MHz guide-bearing mux for
+   `CAPTURE_SECONDS` (90 seconds by default).
 5. Give Plex `http://PORTAINER-IP:8080/guide.xml` as its XMLTV URL.
 
 Persistent state is in the named volume `epg2xmltv_data`. Do not remove it when
@@ -57,6 +61,8 @@ docker exec epg2xmltv python3 /app/epg2xmltv.py collect
 Endpoints are `/guide.xml`, `/status.json`, and `/healthz`. Collection skips if
 all tuners are busy or another run is active. Every tune is enclosed in cleanup
 which stops the stream and sets the selected tuner back to `channel=none`.
+Normal daily tuner occupancy is therefore approximately `CAPTURE_SECONDS` plus
+a few seconds for tuning and XML processing, not one capture per discovered mux.
 Partial failures retain the previous valid XMLTV file.
 
 Stable channel IDs use `dvb.ONID.TSID.SID`; consequently separate SD and HD

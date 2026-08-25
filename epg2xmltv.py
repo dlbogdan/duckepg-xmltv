@@ -369,6 +369,25 @@ def merge(db: sqlite3.Connection, muxes, channels, events):
     db.commit()
 
 
+def remember_collection_frequency(db: sqlite3.Connection, frequency: int):
+    """Persist the known mux which repeats network-wide EIT schedule data."""
+    db.execute("INSERT OR REPLACE INTO metadata VALUES('collection_frequency',?)", (str(frequency),))
+    db.commit()
+
+
+def collection_frequency(cfg: Config, db: sqlite3.Connection) -> int:
+    """Reuse discovery results; never rediscover or traverse all muxes for an update."""
+    row = db.execute("SELECT value FROM metadata WHERE key='collection_frequency'").fetchone()
+    if row:
+        return int(row[0])
+    if cfg.seed_frequency:
+        return cfg.seed_frequency
+    row = db.execute("SELECT frequency FROM muxes ORDER BY last_seen DESC LIMIT 1").fetchone()
+    if not row:
+        raise RuntimeError("no persisted collection frequency; run discovery once")
+    return int(row[0])
+
+
 def xmltv_time(epoch: int) -> str:
     return dt.datetime.fromtimestamp(epoch, UTC).strftime("%Y%m%d%H%M%S +0000")
 
@@ -446,6 +465,9 @@ def discover(cfg: Config):
                 raise RuntimeError("seed locked but NIT advertised no DVB-C muxes")
             db = connect(cfg)
             merge(db, muxes, channels, events)
+            # The verified seed carries EIT schedule-other for the complete
+            # network. Persist it so routine refreshes need only this one mux.
+            remember_collection_frequency(db, frequency)
             channel_count, event_count = publish(cfg, db)
             write_status(cfg, state="ok", operation="discover", muxes=len(muxes),
                          channels=channel_count, programmes=event_count, tuner_released=True)
@@ -463,35 +485,18 @@ def collect(cfg: Config):
     probe.close()
     with RunLock(cfg.data_dir / "run.lock"):
         db = connect(cfg)
-        mux_rows = list(db.execute("SELECT frequency FROM muxes ORDER BY frequency"))
-        all_muxes, all_channels, all_events = {}, {}, []
-        coverage = {}
+        frequency = collection_frequency(cfg, db)
         with HDHomeRun(cfg.tuner_ip) as tuner, tempfile.TemporaryDirectory() as directory:
-            for index, (frequency,) in enumerate(mux_rows):
-                path = Path(directory) / f"mux-{frequency}.xml"
-                try:
-                    tuner.capture_tables(frequency, cfg.capture_seconds, path)
-                    muxes, channels, events = read_tables(path)
-                    all_muxes.update(muxes); all_channels.update(channels); all_events.extend(events)
-                    # Completeness is measured on a second, shorter pass because
-                    # TSDuck XML groups complete tables and omits raw section numbers.
-                    sections = Path(directory) / f"eit-{frequency}.bin"
-                    tuner.capture_eit_sections(frequency, min(30, cfg.capture_seconds), sections)
-                    coverage[frequency] = eit_completeness(sections)
-                except Exception as exc:
-                    LOG.error("mux %s failed: %s", frequency, exc)
-        if not all_events:
+            path = Path(directory) / f"mux-{frequency}.xml"
+            tuner.capture_tables(frequency, cfg.capture_seconds, path)
+            muxes, channels, events = read_tables(path)
+        if not events:
             raise RuntimeError("no EIT programmes collected; preserving previous guide")
-        merge(db, all_muxes, all_channels, all_events)
-        now = int(time.time())
-        db.executemany("INSERT OR REPLACE INTO coverage VALUES(?,?,?,?,?,?,?)",
-                       ((frequency, value["sections"], value["tables"], value["complete_tables"],
-                         value["missing_sections"], int(value["complete"]), now)
-                        for frequency, value in coverage.items()))
-        db.commit()
+        merge(db, muxes, channels, events)
         channel_count, event_count = publish(cfg, db)
-        write_status(cfg, state="ok", operation="collect", muxes=len(mux_rows),
-                     channels=channel_count, programmes=event_count, coverage=coverage,
+        write_status(cfg, state="ok", operation="collect", muxes=1,
+                     collection_frequency=frequency,
+                     channels=channel_count, programmes=event_count,
                      tuner_released=True)
 
 

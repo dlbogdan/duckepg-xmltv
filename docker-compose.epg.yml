@@ -12,6 +12,7 @@ services:
       TZ: ${TZ:-Europe/Bucharest}
       SCHEDULE: ${EPG_SCHEDULE:-03:00}
       SEED_FREQUENCY: ${SEED_FREQUENCY:-706000000}
+      # One daily capture of the persisted guide-bearing mux, not per discovered mux.
       CAPTURE_SECONDS: ${CAPTURE_SECONDS:-90}
       HTTP_PORT: 8080
     volumes:
