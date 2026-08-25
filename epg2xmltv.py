@@ -144,33 +144,38 @@ class HDHomeRun:
         assert self.tuner is not None
         status = self.tune(frequency)
         LOG.info("capturing %s Hz: %s", frequency, status)
+        transport = output.with_suffix(".ts")
         save = subprocess.Popen(
-            ["hdhomerun_config", self.ip, "save", f"/tuner{self.tuner}", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-        )
-        tsp = subprocess.Popen(
-            ["tsp", "-I", "file", "-P", "tables", "--pid", "0", "--pid", "16",
-             "--pid", "17", "--pid", "18", "--xml-output", str(output), "-O", "drop"],
-            stdin=save.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            ["hdhomerun_config", self.ip, "save", f"/tuner{self.tuner}", str(transport)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        assert save.stdout
-        save.stdout.close()
         try:
             time.sleep(seconds)
         finally:
             if save.poll() is None:
                 os.killpg(save.pid, signal.SIGTERM)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                save.wait(timeout=5)
             try:
-                tsp.wait(timeout=15)
+                save.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                os.killpg(tsp.pid, signal.SIGTERM)
-                tsp.wait(timeout=5)
+                os.killpg(save.pid, signal.SIGKILL)
+                save.wait(timeout=5)
+        if not transport.exists() or transport.stat().st_size == 0:
+            error = (save.stderr.read() if save.stderr else b"").decode(errors="replace")
+            raise RuntimeError(f"HDHomeRun produced no transport stream: {error[-500:]}")
+        LOG.info("captured %.1f MiB; decoding DVB tables", transport.stat().st_size / 1048576)
+        decoded = subprocess.run(
+            ["tsp", "-I", "file", str(transport), "-P", "tables",
+             "--pid", "0", "--pid", "16", "--pid", "17", "--pid", "18",
+             "--xml-output", str(output), "-O", "drop"],
+            capture_output=True, timeout=max(30, seconds), check=False,
+        )
         if not output.exists() or output.stat().st_size == 0:
-            error = (tsp.stderr.read() if tsp.stderr else b"").decode(errors="replace")
+            error = decoded.stderr.decode(errors="replace")
             raise RuntimeError(f"TSDuck produced no table XML: {error[-500:]}")
+        if decoded.returncode:
+            LOG.warning("TSDuck exited %s after producing table XML: %s",
+                        decoded.returncode, decoded.stderr.decode(errors="replace")[-500:])
 
     def capture_eit_sections(self, frequency: int, seconds: int, output: Path):
         """Capture every unique EIT section, including section metadata."""
