@@ -3,9 +3,11 @@ services:
     build:
       context: .
     container_name: epg2xmltv
+    # HDHomeRun sends the MPEG-TS back over UDP to the requesting host. Bridge
+    # NAT advertises an address the physical tuner cannot reach, so use the
+    # Portainer host network for capture traffic.
+    network_mode: host
     restart: unless-stopped
-    ports:
-      - "${EPG_HTTP_PORT:-8080}:8080"
     environment:
       TUNER_IP: ${TUNER_IP:-10.9.2.132}
       TZ: ${TZ:-Europe/Bucharest}

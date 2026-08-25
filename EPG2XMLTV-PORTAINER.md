@@ -7,6 +7,12 @@ known guide-bearing mux, persist the last good guide, and serve it at
 `http://PORTAINER-IP:8080/guide.xml` without authentication. Restrict port 8080
 to the trusted LAN in the host firewall.
 
+The container intentionally uses host networking. HDHomeRun control is TCP,
+but transport capture is sent back by the tuner over UDP to the requesting
+machine. Docker bridge NAT can advertise a private container address which the
+physical tuner cannot reach, resulting in a perfect RF lock but zero received
+packets. Host networking gives the tuner the reachable Portainer host address.
+
 ## Proven transport path
 
 The earlier successful inspection tuned and captured the full multiplex with
