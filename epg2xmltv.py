@@ -145,24 +145,35 @@ class HDHomeRun:
         status = self.tune(frequency)
         LOG.info("capturing %s Hz: %s", frequency, status)
         transport = output.with_suffix(".ts")
-        save = subprocess.Popen(
-            ["hdhomerun_config", self.ip, "save", f"/tuner{self.tuner}", str(transport)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            time.sleep(seconds)
-        finally:
-            if save.poll() is None:
-                os.killpg(save.pid, signal.SIGTERM)
+        # libhdhomerun's `save ... -` writes the TS to stdout reliably across
+        # package versions. Direct it into our own file instead of asking the
+        # CLI to create a pathname (which some builds silently leave empty).
+        with transport.open("wb") as stream:
+            save = subprocess.Popen(
+                ["hdhomerun_config", self.ip, "save", f"/tuner{self.tuner}", "-"],
+                stdout=stream, stderr=subprocess.PIPE, start_new_session=True,
+            )
             try:
-                save.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(save.pid, signal.SIGKILL)
-                save.wait(timeout=5)
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    if save.poll() is not None:
+                        break
+                    time.sleep(min(1, deadline - time.monotonic()))
+            finally:
+                if save.poll() is None:
+                    os.killpg(save.pid, signal.SIGTERM)
+                try:
+                    save.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(save.pid, signal.SIGKILL)
+                    save.wait(timeout=5)
+            stream.flush()
+            os.fsync(stream.fileno())
         if not transport.exists() or transport.stat().st_size == 0:
             error = (save.stderr.read() if save.stderr else b"").decode(errors="replace")
-            raise RuntimeError(f"HDHomeRun produced no transport stream: {error[-500:]}")
+            raise RuntimeError(
+                f"HDHomeRun produced no transport stream (exit={save.returncode}): {error[-500:]}"
+            )
         LOG.info("captured %.1f MiB; decoding DVB tables", transport.stat().st_size / 1048576)
         decoded = subprocess.run(
             ["tsp", "-I", "file", str(transport), "-P", "tables",
