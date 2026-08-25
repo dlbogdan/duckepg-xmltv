@@ -2,7 +2,9 @@ services:
   epg2xmltv:
     build:
       context: .
-    image: ${EPG_IMAGE:-epg2xmltv:local}
+    # Bump the default tag when deployment code changes so Portainer cannot
+    # silently reuse a stale locally built image during a Git redeploy.
+    image: ${EPG_IMAGE:-epg2xmltv:0.1.3}
     container_name: epg2xmltv
     restart: unless-stopped
     ports:
