@@ -359,6 +359,20 @@ def connect(cfg: Config) -> sqlite3.Connection:
     return db
 
 
+def discovery_complete(cfg: Config) -> bool:
+    """An existing SQLite file alone is not proof that discovery succeeded."""
+    if not cfg.db.exists():
+        return False
+    try:
+        db = sqlite3.connect(cfg.db)
+        try:
+            return db.execute("SELECT 1 FROM muxes LIMIT 1").fetchone() is not None
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return False
+
+
 def merge(db: sqlite3.Connection, muxes, channels, events):
     now = int(time.time())
     db.executemany("INSERT INTO muxes VALUES(:onid,:tsid,:network_id,:frequency,:modulation,:symbol_rate,:now) "
@@ -481,13 +495,8 @@ def discover(cfg: Config):
 
 def collect(cfg: Config):
     # Do not nest the process lock: discovery owns its complete tuner lifecycle.
-    if not cfg.db.exists():
+    if not discovery_complete(cfg):
         return discover(cfg)
-    probe = connect(cfg)
-    if not probe.execute("SELECT 1 FROM muxes LIMIT 1").fetchone():
-        probe.close()
-        return discover(cfg)
-    probe.close()
     with RunLock(cfg.data_dir / "run.lock"):
         db = connect(cfg)
         frequency = collection_frequency(cfg, db)
@@ -543,7 +552,9 @@ def health(cfg: Config) -> tuple[bool, dict]:
         except ET.ParseError:
             pass
     with contextlib.suppress(Exception):
-        db = connect(cfg)
+        # Health checks must never create an empty database which could be
+        # mistaken for completed initial discovery after a failed first run.
+        db = sqlite3.connect(cfg.db)
         try:
             row = db.execute("SELECT value FROM metadata WHERE key='last_success'").fetchone()
             if row:
@@ -571,7 +582,7 @@ def seconds_until(schedule: str, timezone: str) -> float:
 
 def serve(cfg: Config):
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
-    if not cfg.db.exists():
+    if not discovery_complete(cfg):
         try:
             discover(cfg)
         except Exception as exc:

@@ -62,6 +62,13 @@ class Tests(unittest.TestCase):
             app.remember_collection_frequency(db, 706000000)
             self.assertEqual(706000000, app.collection_frequency(cfg, db))
 
+    def test_empty_database_is_not_completed_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = app.Config(data_dir=Path(directory))
+            db = app.connect(cfg)
+            db.close()
+            self.assertFalse(app.discovery_complete(cfg))
+
 
 if __name__ == "__main__":
     unittest.main()
