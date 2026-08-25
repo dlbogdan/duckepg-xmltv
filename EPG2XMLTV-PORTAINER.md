@@ -1,0 +1,80 @@
+# Lightweight HDHomeRun DVB-C EIT to XMLTV
+
+This replaces TVHeadend only for guide collection. Plex remains connected
+directly to the HDHomeRun. The collector uses no more than one free tuner,
+visits multiplexes sequentially, persists the last good guide, and serves it at
+`http://PORTAINER-IP:8080/guide.xml` without authentication. Restrict port 8080
+to the trusted LAN in the host firewall.
+
+## Proven transport path
+
+The earlier successful inspection tuned and captured the full multiplex with
+`hdhomerun_config`, then used TSDuck to decode DVB EIT schedule tables from PID
+`0x12`. It demonstrated Romanian titles, descriptions, categories, and ratings.
+The implementation deliberately preserves that path.
+
+A live 2026-08-25 check of `706000000` Hz found a strong QAM64/6875 lock, five
+services on transport `0x019B`, a NIT advertising 32 transports, SDT metadata
+for those transports, and network-wide EIT schedule data. This confirms that
+706 MHz is a normal TV multiplex which also repeats broad guide data, not a
+dedicated EPG channel.
+
+## Portainer deployment
+
+1. Build and publish the image for both `linux/amd64` and `linux/arm64`:
+
+   ```sh
+   docker buildx build --platform linux/amd64,linux/arm64 \
+     -t REGISTRY/epg2xmltv:latest --push .
+   ```
+
+2. Create a Portainer stack from `docker-compose.epg.yml` and replace
+   `EPG_IMAGE` with the published image. Portainer cannot build a Web-editor
+   stack unless the build context is available from a Git repository.
+3. Keep `TUNER_IP=10.9.2.132`, `TZ=Europe/Bucharest`, and
+   `EPG_SCHEDULE=03:00`. The schedule is local wall-clock time.
+4. The first start captures the known seed, learns the mux/service map from NIT
+   and SDT, stores it in SQLite, and publishes the initial guide.
+5. Give Plex `http://PORTAINER-IP:8080/guide.xml` as its XMLTV URL.
+
+Persistent state is in the named volume `epg2xmltv_data`. Do not remove it when
+recreating the stack.
+
+## Commands and behavior
+
+Run a discovery again after a provider lineup change:
+
+```sh
+docker exec epg2xmltv python3 /app/epg2xmltv.py discover
+```
+
+Run an immediate refresh:
+
+```sh
+docker exec epg2xmltv python3 /app/epg2xmltv.py collect
+```
+
+Endpoints are `/guide.xml`, `/status.json`, and `/healthz`. Collection skips if
+all tuners are busy or another run is active. Every tune is enclosed in cleanup
+which stops the stream and sets the selected tuner back to `channel=none`.
+Partial failures retain the previous valid XMLTV file.
+
+Stable channel IDs use `dvb.ONID.TSID.SID`; consequently separate SD and HD
+services remain separate even when their names match. Plex channel mapping
+should use these stable identities and the emitted logical number/name.
+
+## Migration and rollback
+
+Run this beside TVHeadend for at least two successful daily cycles. Compare
+channel and programme counts, map Plex to the new URL, then disable TVHeadend's
+EPG grabber. Retain `tvheadend_config` until the new endpoint has remained
+healthy. Rollback consists only of restoring the prior Plex XMLTV URL and
+starting TVHeadend again.
+
+## Generic no-provider-information discovery
+
+Set `SEED_FREQUENCY=0` to invoke the HDHomeRun's DVB-C scan on the one selected
+tuner. The collector extracts locked frequencies, captures their service
+tables, and persists the NIT-advertised network. This is slower than using the
+verified seed and should only be repeated after provider changes. The default
+uses 706 MHz because it avoids an unnecessary full-band scan.
