@@ -178,6 +178,10 @@ class HDHomeRun:
         decoded = subprocess.run(
             ["tsp", "-I", "file", str(transport), "-P", "tables",
              "--pid", "0", "--pid", "16", "--pid", "17", "--pid", "18",
+             # Schedule EIT is segmented and providers commonly omit trailing
+             # empty sections. Flush the complete sections received before EOF
+             # instead of discarding each table as "incomplete".
+             "--pack-and-flush",
              "--xml-output", str(output), "-O", "drop"],
             capture_output=True, timeout=max(30, seconds), check=False,
         )

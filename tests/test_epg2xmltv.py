@@ -70,6 +70,10 @@ class Tests(unittest.TestCase):
             db.close()
             self.assertFalse(app.discovery_complete(cfg))
 
+    def test_capture_decoder_flushes_segmented_eit(self):
+        source = Path(app.__file__).read_text()
+        self.assertIn('"--pack-and-flush"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
