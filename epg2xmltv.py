@@ -435,9 +435,12 @@ def publish(cfg: Config, db: sqlite3.Connection):
     known = {(r["onid"], r["tsid"], r["sid"]) for r in channels}
     for row in channels:
         element = ET.SubElement(root, "channel", {"id": channel_id(row)})
+        # XMLTV consumers commonly treat the first display-name as the primary
+        # label. Emit the station name before the optional logical number so
+        # Plex does not present every channel as a bare number.
+        ET.SubElement(element, "display-name").text = row["name"]
         if row["lcn"] is not None:
             ET.SubElement(element, "display-name").text = str(row["lcn"])
-        ET.SubElement(element, "display-name").text = row["name"]
     count = 0
     for row in db.execute("SELECT * FROM events WHERE stop >= ? ORDER BY start,onid,tsid,sid", (cutoff,)):
         if (row["onid"], row["tsid"], row["sid"]) not in known:

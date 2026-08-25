@@ -32,6 +32,7 @@ class Tests(unittest.TestCase):
             root = ET.parse(cfg.guide).getroot()
             self.assertEqual((2, 1), (channel_count, event_count))
             self.assertEqual("tv", root.tag)
+            self.assertEqual("TVR 1", root.findtext("channel/display-name"))
             self.assertFalse(cfg.guide.with_suffix(".xml.tmp").exists())
 
     def test_next_schedule_is_bounded(self):
