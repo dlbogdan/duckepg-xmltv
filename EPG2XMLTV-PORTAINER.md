@@ -29,9 +29,10 @@ dedicated EPG channel.
      -t REGISTRY/epg2xmltv:latest --push .
    ```
 
-2. Create a Portainer stack from `docker-compose.epg.yml` and replace
-   `EPG_IMAGE` with the published image. Portainer cannot build a Web-editor
-   stack unless the build context is available from a Git repository.
+2. Create a Portainer Git stack from `docker-compose.epg.yml`. Portainer clones
+   the repository and builds the image from its Dockerfile. Do not enable
+   **Re-pull image** for this Git-build deployment: there is intentionally no
+   registry image to pull.
 3. Keep `TUNER_IP=10.9.2.132`, `TZ=Europe/Bucharest`, and
    `EPG_SCHEDULE=03:00`. The schedule is local wall-clock time.
 4. The first start captures the known seed, learns the mux/service map from NIT
