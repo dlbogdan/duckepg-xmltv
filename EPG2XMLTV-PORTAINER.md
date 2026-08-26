@@ -78,10 +78,12 @@ Partial failures retain the previous valid XMLTV file.
 The collector automatically matches services against IPTV-org's CC0
 channel/logo catalogue. It downloads only PNG, JPEG, or WebP images, validates
 their signatures and size, requires HTTPS and public DNS/IP destinations, and
-caches them persistently under `/data/logos/cache`. The XMLTV contains a
-root-relative `<icon src="/logos/cache/HASH.png">`; Plex fetches that path from
-the same collector. Content-hashed filenames allow changed artwork to receive a
-new URL. Run Plex **Refresh Guide** after first enabling logos.
+caches them persistently under `/data/logos/cache`. The XMLTV contains an
+absolute `<icon src="http://10.9.2.13:8080/logos/cache/HASH.png">`; Plex does
+not reliably resolve relative XMLTV icon paths. Set `PUBLIC_BASE_URL` if the
+collector is reached through another address. Content-hashed filenames allow
+changed artwork to receive a new URL. Run Plex **Refresh Guide** after first
+enabling logos.
 
 The catalogue metadata is refreshed weekly and cached images are revalidated
 at most every 30 days. A failed catalogue or image request never prevents guide

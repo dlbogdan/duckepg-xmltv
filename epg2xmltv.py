@@ -50,6 +50,7 @@ class Config:
     schedule: str = env("SCHEDULE", "06:00,14:00")
     timezone: str = env("TZ", "Europe/Bucharest")
     http_port: int = int(env("HTTP_PORT", "8080"))
+    public_base_url: str = env("PUBLIC_BASE_URL", "http://10.9.2.13:8080").rstrip("/")
     expiry_hours: int = int(env("EXPIRY_HOURS", "12"))
     logos_enabled: bool = env("LOGOS_ENABLED", "true").lower() == "true"
     logo_catalog_url: str = env("LOGO_CATALOG_URL", "https://iptv-org.github.io/api/logos.json")
@@ -762,7 +763,8 @@ def publish(cfg: Config, db: sqlite3.Connection):
         if row["lcn"] is not None:
             ET.SubElement(element, "display-name").text = str(row["lcn"])
         if channel_id(row) in logos:
-            ET.SubElement(element, "icon", {"src": logos[channel_id(row)]})
+            # Plex does not reliably resolve root-relative XMLTV icon paths.
+            ET.SubElement(element, "icon", {"src": cfg.public_base_url + logos[channel_id(row)]})
     count = 0
     for row in db.execute("SELECT * FROM events WHERE stop >= ? ORDER BY start,onid,tsid,sid", (cutoff,)):
         if (row["onid"], row["tsid"], row["sid"]) not in known:

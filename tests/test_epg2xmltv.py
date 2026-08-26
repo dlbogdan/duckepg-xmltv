@@ -37,6 +37,11 @@ class Tests(unittest.TestCase):
             self.assertFalse(cfg.guide.with_suffix(".xml.tmp").exists())
             db.close()
 
+    def test_xmltv_logo_urls_are_absolute_for_plex(self):
+        self.assertTrue(app.Config().public_base_url.startswith("http"))
+        source = Path(app.__file__).read_text()
+        self.assertIn('cfg.public_base_url + logos[channel_id(row)]', source)
+
     def test_next_schedule_is_bounded(self):
         wait = app.seconds_until("06:00,14:00", "Europe/Bucharest")
         self.assertGreater(wait, 0); self.assertLessEqual(wait, 86400)
