@@ -36,8 +36,13 @@ class Tests(unittest.TestCase):
             self.assertFalse(cfg.guide.with_suffix(".xml.tmp").exists())
 
     def test_next_schedule_is_bounded(self):
-        wait = app.seconds_until("03:00", "Europe/Bucharest")
+        wait = app.seconds_until("06:00,14:00", "Europe/Bucharest")
         self.assertGreater(wait, 0); self.assertLessEqual(wait, 86400)
+
+    def test_multi_schedule_chooses_next_run(self):
+        wait = app.seconds_until("00:00,23:59", "UTC")
+        self.assertGreater(wait, 0)
+        self.assertLessEqual(wait, 24 * 60 * 60)
 
     def test_eit_section_completeness(self):
         # Minimal synthetic long sections: section 0 and 1, last_section_number 1.

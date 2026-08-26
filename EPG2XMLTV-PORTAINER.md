@@ -40,12 +40,12 @@ dedicated EPG channel.
    **Re-pull image** for this Git-build deployment: there is intentionally no
    registry image to pull.
 3. Keep `TUNER_IP=10.9.2.132`, `TZ=Europe/Bucharest`, and
-   `EPG_SCHEDULE=03:00`. The schedule is local wall-clock time.
+   `EPG_SCHEDULE=06:00,14:00`. Schedule values are local wall-clock times.
 4. The first start captures the known seed, learns the mux/service map from NIT
    and SDT, stores it in SQLite, and publishes the initial guide. Subsequent
-   scheduled updates do not rediscover or traverse the mux list: they capture
-   network-wide EIT from the persisted 706 MHz guide-bearing mux for
-   `CAPTURE_SECONDS` (90 seconds by default).
+   scheduled updates do not rediscover the network. They reuse the persisted
+   mux list and visit those known frequencies sequentially, capturing only EIT
+   PID `0x12` for `EIT_CAPTURE_SECONDS` (15 seconds by default) on one tuner.
 5. Give Plex `http://PORTAINER-IP:8080/guide.xml` as its XMLTV URL.
 
 Persistent state is in the named volume `epg2xmltv_data`. Do not remove it when
@@ -68,8 +68,9 @@ docker exec epg2xmltv python3 /app/epg2xmltv.py collect
 Endpoints are `/guide.xml`, `/status.json`, and `/healthz`. Collection skips if
 all tuners are busy or another run is active. Every tune is enclosed in cleanup
 which stops the stream and sets the selected tuner back to `channel=none`.
-Normal daily tuner occupancy is therefore approximately `CAPTURE_SECONDS` plus
-a few seconds for tuning and XML processing, not one capture per discovered mux.
+With 32 muxes, normal tuner occupancy is approximately 9 minutes per scheduled
+run: 15 seconds of EIT plus roughly 2 seconds to tune each mux. Only one tuner
+is used; no provider discovery or full-band scan occurs during routine updates.
 Partial failures retain the previous valid XMLTV file.
 
 Stable channel IDs use `dvb.ONID.TSID.SID`; consequently separate SD and HD

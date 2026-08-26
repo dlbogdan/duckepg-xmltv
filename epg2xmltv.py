@@ -38,8 +38,9 @@ class Config:
     data_dir: Path = Path(env("DATA_DIR", "./data"))
     seed_frequency: int = int(env("SEED_FREQUENCY", "706000000"))
     capture_seconds: int = int(env("CAPTURE_SECONDS", "90"))
+    eit_capture_seconds: int = int(env("EIT_CAPTURE_SECONDS", "15"))
     scan_if_no_seed: bool = env("SCAN_IF_NO_SEED", "true").lower() == "true"
-    schedule: str = env("SCHEDULE", "03:00")
+    schedule: str = env("SCHEDULE", "06:00,14:00")
     timezone: str = env("TZ", "Europe/Bucharest")
     http_port: int = int(env("HTTP_PORT", "8080"))
     expiry_hours: int = int(env("EXPIRY_HOURS", "12"))
@@ -119,7 +120,7 @@ class HDHomeRun:
         if self.tuner is None:
             return
         tuner, self.tuner = self.tuner, None
-        for item in ("target", "channel"):
+        for item in ("target", "filter", "channel"):
             with contextlib.suppress(Exception):
                 self.cmd("set", f"/tuner{tuner}/{item}", "none", check=False)
         LOG.info("released tuner %s", tuner)
@@ -218,6 +219,46 @@ class HDHomeRun:
                 tsp.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(tsp.pid, signal.SIGTERM); tsp.wait(timeout=5)
+
+    def capture_eit_tables(self, frequency: int, seconds: int, output: Path):
+        """Capture only EIT PID 0x12 and decode received segmented tables."""
+        assert self.tuner is not None
+        status = self.tune(frequency)
+        self.cmd("set", f"/tuner{self.tuner}/filter", "0x0012")
+        LOG.info("collecting EIT for %ss from %s Hz: %s", seconds, frequency, status)
+        save = subprocess.Popen(
+            ["hdhomerun_config", self.ip, "save", f"/tuner{self.tuner}", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        tsp = subprocess.Popen(
+            ["tsp", "-I", "file", "-P", "tables", "--pid", "18",
+             "--pack-and-flush", "--xml-output", str(output), "-O", "drop"],
+            stdin=save.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert save.stdout
+        save.stdout.close()
+        try:
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if save.poll() is not None:
+                    break
+                time.sleep(min(1, deadline - time.monotonic()))
+        finally:
+            if save.poll() is None:
+                os.killpg(save.pid, signal.SIGTERM)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                save.wait(timeout=5)
+            try:
+                tsp.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(tsp.pid, signal.SIGTERM)
+                tsp.wait(timeout=5)
+            # Never carry an EIT-only filter into the next tune or release.
+            self.cmd("set", f"/tuner{self.tuner}/filter", "none", check=False)
+        if not output.exists() or output.stat().st_size == 0:
+            error = (tsp.stderr.read() if tsp.stderr else b"").decode(errors="replace")
+            raise RuntimeError(f"no EIT tables decoded at {frequency}: {error[-500:]}")
 
 
     def scan_frequencies(self) -> list[int]:
@@ -517,17 +558,29 @@ def collect(cfg: Config):
         return discover(cfg)
     with RunLock(cfg.data_dir / "run.lock"):
         db = connect(cfg)
-        frequency = collection_frequency(cfg, db)
+        frequencies = [row[0] for row in db.execute(
+            "SELECT DISTINCT frequency FROM muxes ORDER BY frequency"
+        )]
+        if not frequencies:
+            raise RuntimeError("no persisted mux frequencies; run discovery once")
+        all_events, succeeded, failed = [], 0, []
         with HDHomeRun(cfg.tuner_ip) as tuner, tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / f"mux-{frequency}.xml"
-            tuner.capture_tables(frequency, cfg.capture_seconds, path)
-            muxes, channels, events = read_tables(path)
-        if not events:
+            for frequency in frequencies:
+                path = Path(directory) / f"eit-{frequency}.xml"
+                try:
+                    tuner.capture_eit_tables(frequency, cfg.eit_capture_seconds, path)
+                    _, _, events = read_tables(path)
+                    all_events.extend(events)
+                    succeeded += 1
+                except Exception as exc:
+                    failed.append(frequency)
+                    LOG.warning("EIT collection failed at %s Hz: %s", frequency, exc)
+        if not all_events:
             raise RuntimeError("no EIT programmes collected; preserving previous guide")
-        merge(db, muxes, channels, events)
+        merge(db, {}, {}, all_events)
         channel_count, event_count = publish(cfg, db)
-        write_status(cfg, state="ok", operation="collect", muxes=1,
-                     collection_frequency=frequency,
+        write_status(cfg, state="ok" if succeeded else "error", operation="collect",
+                     muxes=len(frequencies), muxes_succeeded=succeeded, muxes_failed=failed,
                      channels=channel_count, programmes=event_count,
                      tuner_released=True)
 
@@ -595,13 +648,18 @@ def health(cfg: Config) -> tuple[bool, dict]:
 
 
 def seconds_until(schedule: str, timezone: str) -> float:
-    hour, minute = map(int, schedule.split(":"))
     zone = ZoneInfo(timezone)
     now = dt.datetime.now(zone)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += dt.timedelta(days=1)
-    return (target - now).total_seconds()
+    waits = []
+    for value in schedule.split(","):
+        hour, minute = map(int, value.strip().split(":"))
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += dt.timedelta(days=1)
+        waits.append((target - now).total_seconds())
+    if not waits:
+        raise ValueError("SCHEDULE must contain at least one HH:MM value")
+    return min(waits)
 
 
 def serve(cfg: Config):
@@ -615,7 +673,7 @@ def serve(cfg: Config):
     Handler.cfg = cfg
     server = http.server.ThreadingHTTPServer(("0.0.0.0", cfg.http_port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    LOG.info("XMLTV available on port %s; next daily run at %s %s", cfg.http_port, cfg.schedule, cfg.timezone)
+    LOG.info("XMLTV available on port %s; scheduled runs at %s %s", cfg.http_port, cfg.schedule, cfg.timezone)
     while True:
         time.sleep(seconds_until(cfg.schedule, cfg.timezone))
         try:
