@@ -7,17 +7,24 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import http.server
+import ipaddress
 import json
 import logging
+import mimetypes
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
+import urllib.parse
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -44,6 +51,11 @@ class Config:
     timezone: str = env("TZ", "Europe/Bucharest")
     http_port: int = int(env("HTTP_PORT", "8080"))
     expiry_hours: int = int(env("EXPIRY_HOURS", "12"))
+    logos_enabled: bool = env("LOGOS_ENABLED", "true").lower() == "true"
+    logo_catalog_url: str = env("LOGO_CATALOG_URL", "https://iptv-org.github.io/api/logos.json")
+    channel_catalog_url: str = env("CHANNEL_CATALOG_URL", "https://iptv-org.github.io/api/channels.json")
+    logo_allowed_hosts: str = env("LOGO_ALLOWED_HOSTS", "i.imgur.com,upload.wikimedia.org")
+    logo_max_bytes: int = int(env("LOGO_MAX_BYTES", str(2 * 1024 * 1024)))
 
     @property
     def db(self) -> Path:
@@ -56,6 +68,26 @@ class Config:
     @property
     def status(self) -> Path:
         return self.data_dir / "status.json"
+
+    @property
+    def logos(self) -> Path:
+        return self.data_dir / "logos"
+
+    @property
+    def logo_cache(self) -> Path:
+        return self.logos / "cache"
+
+    @property
+    def logo_local(self) -> Path:
+        return self.logos / "local"
+
+    @property
+    def logo_index(self) -> Path:
+        return self.logos / "index.json"
+
+    @property
+    def logo_overrides(self) -> Path:
+        return self.logos / "overrides.json"
 
 
 class Busy(RuntimeError):
@@ -471,12 +503,243 @@ def channel_id(row) -> str:
     return f"dvb.{row['onid']:04x}.{row['tsid']:04x}.{row['sid']:04x}"
 
 
+def canonical_name(value: str, base: bool = False) -> str:
+    """Normalize conservatively; base=True removes only a terminal quality mark."""
+    value = unicodedata.normalize("NFKD", value).casefold()
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    value = value.replace("&", " and ")
+    value = re.sub(r"[^a-z0-9]+", " ", value).strip()
+    if base:
+        value = re.sub(r"\s+(?:hd|sd|fhd|uhd|4k)$", "", value).strip()
+    return value
+
+
+def atomic_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def safe_remote_url(cfg: Config, value: str, catalogue: bool = False) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    allowed = {x.strip().lower() for x in cfg.logo_allowed_hosts.split(",") if x.strip()}
+    if catalogue:
+        allowed.add("iptv-org.github.io")
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("logo URL must be credential-free HTTPS")
+    if parsed.hostname.lower() not in allowed:
+        raise ValueError(f"logo host is not allowlisted: {parsed.hostname}")
+    for result in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM):
+        address = ipaddress.ip_address(result[4][0])
+        if not address.is_global:
+            raise ValueError(f"logo host resolves to a non-public address: {address}")
+    return value
+
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, cfg: Config, catalogue: bool = False):
+        self.cfg, self.catalogue = cfg, catalogue
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if len(getattr(req, "redirect_dict", {})) >= 3:
+            raise ValueError("too many logo redirects")
+        safe_remote_url(self.cfg, newurl, self.catalogue)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(cfg: Config, url: str, maximum: int, catalogue: bool = False) -> tuple[bytes, str]:
+    safe_remote_url(cfg, url, catalogue)
+    request = urllib.request.Request(url, headers={"User-Agent": "duckepg-xmltv/1 logo-cache"})
+    opener = urllib.request.build_opener(SafeRedirect(cfg, catalogue))
+    for attempt in range(3):
+        try:
+            with opener.open(request, timeout=15) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"HTTP {response.status}")
+                declared = response.headers.get("Content-Length")
+                if declared and int(declared) > maximum:
+                    raise ValueError("download exceeds size limit")
+                body = response.read(maximum + 1)
+                if len(body) > maximum:
+                    raise ValueError("download exceeds size limit")
+                return body, response.headers.get_content_type().lower()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 2:
+                raise
+            delay = min(5, max(1, int(exc.headers.get("Retry-After", "1"))))
+            time.sleep(delay)
+    raise RuntimeError("download retries exhausted")
+
+
+def image_kind(body: bytes, content_type: str) -> tuple[str, str]:
+    allowed_types = {"image/png", "image/jpeg", "image/webp", "application/octet-stream", ""}
+    if content_type.lower().split(";", 1)[0] not in allowed_types:
+        raise ValueError(f"unsupported image content type ({content_type})")
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png", "image/png"
+    if body.startswith(b"\xff\xd8\xff"):
+        return "jpg", "image/jpeg"
+    if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    raise ValueError(f"unsupported or invalid image ({content_type})")
+
+
+def logo_catalogue(cfg: Config, state: dict) -> list[dict]:
+    """Refresh IPTV-org metadata weekly, retaining the last good normalized copy."""
+    path = cfg.logos / "catalog.json"
+    old = read_json(path, [])
+    if time.time() - state.get("catalog_updated", 0) < 7 * 86400 and old:
+        return old
+    channels_raw, _ = download(cfg, cfg.channel_catalog_url, 20 * 1024 * 1024, True)
+    logos_raw, _ = download(cfg, cfg.logo_catalog_url, 20 * 1024 * 1024, True)
+    channels = {x["id"]: x for x in json.loads(channels_raw)}
+    result = []
+    for logo in json.loads(logos_raw):
+        channel = channels.get(logo.get("channel"))
+        if not channel or not logo.get("in_use") or not logo.get("url"):
+            continue
+        names = [channel.get("name", ""), *(channel.get("alt_names") or [])]
+        result.append({"id": channel["id"], "country": channel.get("country"),
+                       "names": [x for x in names if x], "url": logo["url"]})
+    atomic_json(path, result)
+    state["catalog_updated"] = int(time.time())
+    return result
+
+
+def resolve_catalogue(name: str, catalogue: list[dict]) -> tuple[dict | None, str | None]:
+    passes = (
+        ("ro_exact", False, "RO"),
+        ("ro_sd_hd_fallback", True, "RO"),
+        ("global_exact", False, None),
+        ("global_sd_hd_fallback", True, None),
+    )
+    for method, base, country in passes:
+        wanted = canonical_name(name, base)
+        candidates = {item["id"]: item for item in catalogue
+                      if country is None or item.get("country") == country
+                      if any(canonical_name(candidate, base) == wanted for candidate in item["names"])}
+        if len(candidates) == 1:
+            return next(iter(candidates.values())), method
+        if len(candidates) > 1:
+            return None, "ambiguous"
+    return None, None
+
+
+def load_overrides(cfg: Config) -> dict:
+    value = read_json(cfg.logo_overrides, {"ids": {}, "names": {}})
+    if not isinstance(value, dict) or not isinstance(value.get("ids", {}), dict) or not isinstance(value.get("names", {}), dict):
+        raise ValueError("logo overrides must contain object-valued ids and names")
+    return {"ids": value.get("ids", {}), "names": value.get("names", {})}
+
+
+def local_logo(cfg: Config, value: str) -> tuple[Path, str]:
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        raise ValueError("local logo override must be a plain filename")
+    path = cfg.logo_local / value
+    resolved, root = path.resolve(), cfg.logo_local.resolve()
+    if root not in resolved.parents or not resolved.is_file():
+        raise ValueError("local logo override does not exist")
+    ext, mime = image_kind(resolved.read_bytes(), mimetypes.guess_type(value)[0] or "")
+    return resolved, mime
+
+
+def sync_logos(cfg: Config, channels) -> tuple[dict[str, str], dict]:
+    """Resolve/cache logos. Every error is isolated from guide publication."""
+    if not cfg.logos_enabled:
+        return {}, {"enabled": False}
+    cfg.logo_cache.mkdir(parents=True, exist_ok=True); cfg.logo_local.mkdir(parents=True, exist_ok=True)
+    state = read_json(cfg.logo_index, {"entries": {}}); state.setdefault("entries", {})
+    metrics = {"enabled": True, "resolved": 0, "overridden": 0, "fallback": 0,
+               "unresolved": 0, "ambiguous": 0, "failed": 0}
+    try:
+        overrides = load_overrides(cfg)
+    except Exception as exc:
+        LOG.warning("logo overrides ignored: %s", exc); overrides = {"ids": {}, "names": {}}
+    try:
+        catalogue = logo_catalogue(cfg, state)
+    except Exception as exc:
+        LOG.warning("logo catalogue refresh failed; using last good copy: %s", exc)
+        catalogue = read_json(cfg.logos / "catalog.json", [])
+    result = {}
+    # SD/HD services commonly share a source. Reuse one validated download
+    # within a run rather than hitting an upstream image host per DVB service.
+    source_files = {entry.get("source"): entry for entry in state["entries"].values()
+                    if entry.get("source") and (cfg.logo_cache / entry.get("file", "-")).is_file()}
+    for row in channels:
+        identity, name = channel_id(row), row["name"]
+        override_present = identity in overrides["ids"] or name in overrides["names"]
+        override = overrides["ids"].get(identity, overrides["names"].get(name))
+        if override_present and override is None:
+            metrics["unresolved"] += 1; continue
+        source, method = None, None
+        try:
+            if override_present and isinstance(override, str) and override.startswith("https://"):
+                source, method = override, "override"
+            elif override_present:
+                path, _ = local_logo(cfg, override)
+                result[identity] = f"/logos/local/{urllib.parse.quote(path.name)}"
+                metrics["resolved"] += 1; metrics["overridden"] += 1; continue
+            else:
+                candidate, method = resolve_catalogue(name, catalogue)
+                if candidate: source = candidate["url"]
+                elif method == "ambiguous": metrics["ambiguous"] += 1; continue
+                else: metrics["unresolved"] += 1; continue
+            entry = state["entries"].get(identity, {})
+            cached = cfg.logo_cache / entry.get("file", "-")
+            due = time.time() - entry.get("checked", 0) >= 30 * 86400
+            shared = source_files.get(source)
+            if shared and (not cached.is_file() or entry.get("source") != source):
+                entry = {**shared, "method": method}
+                state["entries"][identity] = entry
+                cached = cfg.logo_cache / entry["file"]
+                due = False
+            if not cached.is_file() or entry.get("source") != source or due:
+                body, supplied = download(cfg, source, cfg.logo_max_bytes)
+                ext, mime = image_kind(body, supplied)
+                filename = hashlib.sha256(body).hexdigest()[:24] + "." + ext
+                final = cfg.logo_cache / filename
+                if not final.exists():
+                    temporary = cfg.logo_cache / (filename + ".tmp")
+                    with temporary.open("wb") as stream:
+                        stream.write(body); stream.flush(); os.fsync(stream.fileno())
+                    os.replace(temporary, final)
+                state["entries"][identity] = {"source": source, "file": filename,
+                                               "mime": mime, "checked": int(time.time()), "method": method}
+                source_files[source] = state["entries"][identity]
+                cached = final
+            result[identity] = "/logos/cache/" + cached.name
+            metrics["resolved"] += 1
+            if method == "override": metrics["overridden"] += 1
+            if method and method.endswith("sd_hd_fallback"): metrics["fallback"] += 1
+        except Exception as exc:
+            old = state["entries"].get(identity, {}); cached = cfg.logo_cache / old.get("file", "-")
+            if cached.is_file():
+                result[identity] = "/logos/cache/" + cached.name; metrics["resolved"] += 1
+            else:
+                metrics["failed"] += 1
+            LOG.warning("logo unavailable for %s (%s): %s", name, identity, exc)
+    state["metrics"] = metrics
+    atomic_json(cfg.logo_index, state)
+    return result, metrics
+
+
 def publish(cfg: Config, db: sqlite3.Connection):
     db.row_factory = sqlite3.Row
     cutoff = int(time.time()) - cfg.expiry_hours * 3600
     db.execute("DELETE FROM events WHERE stop < ?", (cutoff,))
     root = ET.Element("tv", {"generator-info-name": "epg2xmltv"})
     channels = list(db.execute("SELECT * FROM channels ORDER BY COALESCE(lcn,99999),name,onid,tsid,sid"))
+    logos, logo_metrics = sync_logos(cfg, channels)
     known = {(r["onid"], r["tsid"], r["sid"]) for r in channels}
     for row in channels:
         element = ET.SubElement(root, "channel", {"id": channel_id(row)})
@@ -486,6 +749,8 @@ def publish(cfg: Config, db: sqlite3.Connection):
         ET.SubElement(element, "display-name").text = row["name"]
         if row["lcn"] is not None:
             ET.SubElement(element, "display-name").text = str(row["lcn"])
+        if channel_id(row) in logos:
+            ET.SubElement(element, "icon", {"src": logos[channel_id(row)]})
     count = 0
     for row in db.execute("SELECT * FROM events WHERE stop >= ? ORDER BY start,onid,tsid,sid", (cutoff,)):
         if (row["onid"], row["tsid"], row["sid"]) not in known:
@@ -508,7 +773,7 @@ def publish(cfg: Config, db: sqlite3.Connection):
     ET.parse(tmp)
     os.replace(tmp, cfg.guide)
     db.commit()
-    return len(channels), count
+    return len(channels), count, logo_metrics
 
 
 def write_status(cfg: Config, **values):
@@ -546,9 +811,10 @@ def discover(cfg: Config):
             # The verified seed carries EIT schedule-other for the complete
             # network. Persist it so routine refreshes need only this one mux.
             remember_collection_frequency(db, frequency)
-            channel_count, event_count = publish(cfg, db)
+            channel_count, event_count, logo_metrics = publish(cfg, db)
             write_status(cfg, state="ok", operation="discover", muxes=len(muxes),
-                         channels=channel_count, programmes=event_count, tuner_released=True)
+                         channels=channel_count, programmes=event_count, logos=logo_metrics,
+                         tuner_released=True)
             LOG.info("discovered %d muxes and %d services", len(muxes), len(channels))
 
 
@@ -578,10 +844,11 @@ def collect(cfg: Config):
         if not all_events:
             raise RuntimeError("no EIT programmes collected; preserving previous guide")
         merge(db, {}, {}, all_events)
-        channel_count, event_count = publish(cfg, db)
+        channel_count, event_count, logo_metrics = publish(cfg, db)
         write_status(cfg, state="ok" if succeeded else "error", operation="collect",
                      muxes=len(frequencies), muxes_succeeded=succeeded, muxes_failed=failed,
                      channels=channel_count, programmes=event_count,
+                     logos=logo_metrics,
                      tuner_released=True)
 
 
@@ -599,7 +866,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200 if healthy else 503); self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
             return
+        if self.path.startswith("/logos/"):
+            return self.send_logo()
         self.send_error(404)
+
+    def send_logo(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        parts = parsed.path.split("/")
+        if len(parts) != 4 or parts[:2] != ["", "logos"] or parts[2] not in ("cache", "local"):
+            return self.send_error(404)
+        filename = urllib.parse.unquote(parts[3])
+        if not filename or Path(filename).name != filename or filename.startswith("."):
+            return self.send_error(404)
+        root = self.cfg.logo_cache if parts[2] == "cache" else self.cfg.logo_local
+        path = root / filename
+        try:
+            resolved = path.resolve()
+            if root.resolve() not in resolved.parents or not resolved.is_file():
+                return self.send_error(404)
+            body = resolved.read_bytes()
+            _, content_type = image_kind(body, mimetypes.guess_type(filename)[0] or "")
+        except (OSError, ValueError):
+            return self.send_error(404)
+        etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304); self.send_header("ETag", etag); self.end_headers(); return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", self.date_time_string(resolved.stat().st_mtime))
+            self.send_header("Cache-Control", "public, max-age=604800, immutable" if parts[2] == "cache" else "public, max-age=3600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers(); self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            LOG.debug("client disconnected while receiving logo %s", filename)
 
     def send_file(self, path: Path, content_type: str):
         if not path.exists():

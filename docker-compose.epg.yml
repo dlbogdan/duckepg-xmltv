@@ -17,6 +17,11 @@ services:
       CAPTURE_SECONDS: ${CAPTURE_SECONDS:-90}
       EIT_CAPTURE_SECONDS: ${EIT_CAPTURE_SECONDS:-15}
       HTTP_PORT: 8080
+      # Automatic Romanian channel-logo matching; images are cached in /data.
+      LOGOS_ENABLED: ${LOGOS_ENABLED:-true}
+      # Only these image hosts may be downloaded. Add a host here before using
+      # it in a remote manual override.
+      LOGO_ALLOWED_HOSTS: ${LOGO_ALLOWED_HOSTS:-i.imgur.com,upload.wikimedia.org}
     volumes:
       - epg2xmltv_data:/data
 

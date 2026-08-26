@@ -24,16 +24,18 @@ class Tests(unittest.TestCase):
 
     def test_merge_and_atomic_xmltv(self):
         with tempfile.TemporaryDirectory() as directory:
-            cfg = app.Config(data_dir=Path(directory), expiry_hours=100000)
+            cfg = app.Config(data_dir=Path(directory), expiry_hours=100000, logos_enabled=False)
             path = Path(directory) / "tables.xml"; path.write_text(TABLES)
             muxes, channels, events = app.read_tables(path)
             db = app.connect(cfg); app.merge(db, muxes, channels, events)
-            channel_count, event_count = app.publish(cfg, db)
+            channel_count, event_count, logo_metrics = app.publish(cfg, db)
             root = ET.parse(cfg.guide).getroot()
             self.assertEqual((2, 1), (channel_count, event_count))
+            self.assertFalse(logo_metrics["enabled"])
             self.assertEqual("tv", root.tag)
             self.assertEqual("TVR 1", root.findtext("channel/display-name"))
             self.assertFalse(cfg.guide.with_suffix(".xml.tmp").exists())
+            db.close()
 
     def test_next_schedule_is_bounded(self):
         wait = app.seconds_until("06:00,14:00", "Europe/Bucharest")
@@ -82,6 +84,40 @@ class Tests(unittest.TestCase):
     def test_http_ignores_client_disconnects(self):
         source = Path(app.__file__).read_text()
         self.assertIn("except (BrokenPipeError, ConnectionResetError):", source)
+
+    def test_channel_name_canonicalization_and_quality_fallback(self):
+        self.assertEqual("tvr targu mures", app.canonical_name(" TVR Târgu-Mureș "))
+        self.assertEqual("pro tv", app.canonical_name("PRO TV HD", base=True))
+
+    def test_catalogue_resolution_is_exact_and_unambiguous(self):
+        catalogue = [
+            {"id": "PROTV.ro", "country": "RO", "names": ["PRO TV"], "url": "https://i.imgur.com/a.png"},
+            {"id": "PROArena.ro", "country": "RO", "names": ["PRO Arena"], "url": "https://i.imgur.com/b.png"},
+        ]
+        match, method = app.resolve_catalogue("PRO TV HD", catalogue)
+        self.assertEqual("PROTV.ro", match["id"])
+        self.assertEqual("ro_sd_hd_fallback", method)
+        self.assertEqual((None, None), app.resolve_catalogue("PRO", catalogue))
+
+    def test_catalogue_resolution_allows_unique_international_channels(self):
+        catalogue = [
+            {"id": "CNN.us", "country": "US", "names": ["CNN"], "url": "https://i.imgur.com/cnn.png"},
+            {"id": "Antena3.ro", "country": "RO", "names": ["Antena 3"], "url": "https://i.imgur.com/a3ro.png"},
+            {"id": "Antena3.es", "country": "ES", "names": ["Antena 3"], "url": "https://i.imgur.com/a3es.png"},
+        ]
+        match, method = app.resolve_catalogue("CNN HD", catalogue)
+        self.assertEqual("CNN.us", match["id"])
+        self.assertEqual("global_sd_hd_fallback", method)
+        match, method = app.resolve_catalogue("Antena 3 HD", catalogue)
+        self.assertEqual("Antena3.ro", match["id"])
+        self.assertEqual("ro_sd_hd_fallback", method)
+
+    def test_image_signature_validation(self):
+        self.assertEqual(("png", "image/png"), app.image_kind(b"\x89PNG\r\n\x1a\nrest", "image/png"))
+        with self.assertRaises(ValueError):
+            app.image_kind(b"\x89PNG\r\n\x1a\nrest", "text/html")
+        with self.assertRaises(ValueError):
+            app.image_kind(b"<html>not an image</html>", "image/png")
 
 
 if __name__ == "__main__":

@@ -73,6 +73,56 @@ run: 15 seconds of EIT plus roughly 2 seconds to tune each mux. Only one tuner
 is used; no provider discovery or full-band scan occurs during routine updates.
 Partial failures retain the previous valid XMLTV file.
 
+## Channel logos
+
+The collector automatically matches Romanian services against IPTV-org's CC0
+channel/logo catalogue. It downloads only PNG, JPEG, or WebP images from the
+explicit `LOGO_ALLOWED_HOSTS` list, validates their signatures and size, and
+caches them persistently under `/data/logos/cache`. The XMLTV contains a
+root-relative `<icon src="/logos/cache/HASH.png">`; Plex fetches that path from
+the same collector. Content-hashed filenames allow changed artwork to receive a
+new URL. Run Plex **Refresh Guide** after first enabling logos.
+
+The catalogue metadata is refreshed weekly and cached images are revalidated
+at most every 30 days. A failed catalogue or image request never prevents guide
+publication, and the last valid cached image is retained. Automatic matching
+prefers Romanian catalogue records, then accepts international services only
+when an exact normalized name identifies one globally unique record. A terminal
+`HD`, `SD`, `FHD`, `UHD`, or `4K` marker may fall back to the base channel logo.
+Ambiguous global names remain unresolved rather than receiving a similarly
+named foreign logo.
+
+IPTV-org's API/database metadata is published under CC0/Unlicense, but channel
+logos can remain broadcaster trademarks or copyrighted artwork and their
+upstream hosts have independent terms. The collector caches images instead of
+putting third-party hotlinks in XMLTV. Use it only in accordance with the image
+owner's terms.
+
+Local overrides always take precedence. Create `/data/logos/overrides.json`:
+
+```json
+{
+  "ids": {
+    "dvb.002c.019b.a08d": "tvr1.png",
+    "dvb.002c.019e.a1b9": "https://i.imgur.com/example.png",
+    "dvb.002c.019b.4e21": null
+  },
+  "names": {
+    "RomaniaTV": "romaniatv.png"
+  }
+}
+```
+
+Put local files in `/data/logos/local`. Values are plain local filenames,
+allowlisted HTTPS URLs, or `null` to suppress a logo. Stable DVB-ID mappings win
+over exact-name mappings. Add any remote override host to `LOGO_ALLOWED_HOSTS`.
+Never add private/LAN hosts: remote downloads reject non-public addresses,
+redirects to unapproved hosts, files over 2 MiB, and invalid image content.
+
+Logo counts and failures appear under `logos` in `/status.json`. Logo failures
+do not affect `/healthz`; guide availability and EPG freshness remain the health
+criteria. Set `LOGOS_ENABLED=false` to disable all logo resolution.
+
 Stable channel IDs use `dvb.ONID.TSID.SID`; consequently separate SD and HD
 services remain separate even when their names match. Plex channel mapping
 should use these stable identities and the emitted logical number/name.
