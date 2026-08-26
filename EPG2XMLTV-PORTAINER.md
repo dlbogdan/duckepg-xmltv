@@ -75,9 +75,9 @@ Partial failures retain the previous valid XMLTV file.
 
 ## Channel logos
 
-The collector automatically matches Romanian services against IPTV-org's CC0
-channel/logo catalogue. It downloads only PNG, JPEG, or WebP images from the
-explicit `LOGO_ALLOWED_HOSTS` list, validates their signatures and size, and
+The collector automatically matches services against IPTV-org's CC0
+channel/logo catalogue. It downloads only PNG, JPEG, or WebP images, validates
+their signatures and size, requires HTTPS and public DNS/IP destinations, and
 caches them persistently under `/data/logos/cache`. The XMLTV contains a
 root-relative `<icon src="/logos/cache/HASH.png">`; Plex fetches that path from
 the same collector. Content-hashed filenames allow changed artwork to receive a
@@ -115,7 +115,9 @@ Local overrides always take precedence. Create `/data/logos/overrides.json`:
 
 Put local files in `/data/logos/local`. Values are plain local filenames,
 allowlisted HTTPS URLs, or `null` to suppress a logo. Stable DVB-ID mappings win
-over exact-name mappings. Add any remote override host to `LOGO_ALLOWED_HOSTS`.
+over exact-name mappings. Add any manually configured remote override host to
+`LOGO_ALLOWED_HOSTS`. Catalogue-provided image hosts are validated dynamically
+because IPTV-org references many broadcaster/CDN hosts which change over time.
 Never add private/LAN hosts: remote downloads reject non-public addresses,
 redirects to unapproved hosts, files over 2 MiB, and invalid image content.
 

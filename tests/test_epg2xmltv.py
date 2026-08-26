@@ -119,6 +119,10 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app.image_kind(b"<html>not an image</html>", "image/png")
 
+    def test_catalogue_images_are_not_limited_to_manual_override_hosts(self):
+        source = Path(app.__file__).read_text()
+        self.assertIn('catalogue=method != "override"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

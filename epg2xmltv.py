@@ -537,7 +537,11 @@ def safe_remote_url(cfg: Config, value: str, catalogue: bool = False) -> str:
         allowed.add("iptv-org.github.io")
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("logo URL must be credential-free HTTPS")
-    if parsed.hostname.lower() not in allowed:
+    # Catalogue image hosts are supplied by the configured IPTV-org metadata
+    # source and change over time. Do not require operators to chase that host
+    # list; retain HTTPS, credential, DNS, and public-address validation. Manual
+    # override URLs remain restricted to the explicit allowlist.
+    if not catalogue and parsed.hostname.lower() not in allowed:
         raise ValueError(f"logo host is not allowlisted: {parsed.hostname}")
     for result in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM):
         address = ipaddress.ip_address(result[4][0])
@@ -561,7 +565,7 @@ def download(cfg: Config, url: str, maximum: int, catalogue: bool = False) -> tu
     safe_remote_url(cfg, url, catalogue)
     request = urllib.request.Request(url, headers={"User-Agent": "duckepg-xmltv/1 logo-cache"})
     opener = urllib.request.build_opener(SafeRedirect(cfg, catalogue))
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             with opener.open(request, timeout=15) as response:
                 if response.status != 200:
@@ -574,9 +578,16 @@ def download(cfg: Config, url: str, maximum: int, catalogue: bool = False) -> tu
                     raise ValueError("download exceeds size limit")
                 return body, response.headers.get_content_type().lower()
         except urllib.error.HTTPError as exc:
-            if exc.code != 429 or attempt == 2:
+            if exc.code != 429 or attempt == 4:
                 raise
-            delay = min(5, max(1, int(exc.headers.get("Retry-After", "1"))))
+            # Shared catalogue hosts can throttle a first clean-cache run.
+            # Respect Retry-After and otherwise back off exponentially.
+            try:
+                requested = int(exc.headers.get("Retry-After", "0"))
+            except ValueError:
+                requested = 0
+            delay = min(60, max(requested, 2 ** (attempt + 1)))
+            LOG.info("logo host throttled request; retrying in %ss", delay)
             time.sleep(delay)
     raise RuntimeError("download retries exhausted")
 
@@ -704,7 +715,8 @@ def sync_logos(cfg: Config, channels) -> tuple[dict[str, str], dict]:
                 cached = cfg.logo_cache / entry["file"]
                 due = False
             if not cached.is_file() or entry.get("source") != source or due:
-                body, supplied = download(cfg, source, cfg.logo_max_bytes)
+                body, supplied = download(cfg, source, cfg.logo_max_bytes,
+                                          catalogue=method != "override")
                 ext, mime = image_kind(body, supplied)
                 filename = hashlib.sha256(body).hexdigest()[:24] + "." + ext
                 final = cfg.logo_cache / filename
