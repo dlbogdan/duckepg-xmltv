@@ -552,8 +552,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not path.exists():
             return self.send_error(503, "guide not ready")
         body = path.read_bytes()
-        self.send_response(200); self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        try:
+            self.send_response(200); self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Browsers, Plex probes, and health clients can close a request
+            # after receiving headers or before the complete body. This is a
+            # normal client disconnect, not a collector/server failure.
+            LOG.debug("client %s disconnected while receiving %s", self.client_address[0], self.path)
 
     def log_message(self, fmt, *args):
         LOG.info("http " + fmt, *args)

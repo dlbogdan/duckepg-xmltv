@@ -74,6 +74,10 @@ class Tests(unittest.TestCase):
         source = Path(app.__file__).read_text()
         self.assertIn('"--pack-and-flush"', source)
 
+    def test_http_ignores_client_disconnects(self):
+        source = Path(app.__file__).read_text()
+        self.assertIn("except (BrokenPipeError, ConnectionResetError):", source)
+
 
 if __name__ == "__main__":
     unittest.main()
